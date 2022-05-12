@@ -41,7 +41,7 @@ parser.add_argument(
 # TODO: change for an array
 parser.add_argument(
     '--objs_folder_distrators',
-    default='google_scanned_models/',
+    default='/media/jtremblay/data_large/google_scanned/google_scanned_models/',
     help = "object to load folder"
 )
 parser.add_argument(
@@ -64,7 +64,7 @@ parser.add_argument(
 
 parser.add_argument(
     '--skyboxes_folder',
-    default='dome_hdri_haven/',
+    default='/home/jtremblay/code/visii_mvs/dome_hdri_haven/',
     help = "dome light hdr"
 )
 parser.add_argument(
@@ -265,7 +265,8 @@ visii_pybullet = []
 names_to_export = []
 
 
-def adding_mesh_object(name, obj_to_load, texture_to_load, model_info_path=None, scale=1, debug=False):
+def adding_mesh_object(name, obj_to_load, texture_to_load, model_info_path=None, scale=1, debug=False,
+                        randomize_tex=False):
     global mesh_loaded, visii_pybullet, names_to_export
     # obj_to_load = toy_to_load + "/meshes/model.obj"
     # texture_to_load = toy_to_load + "/materials/textures/texture.png"
@@ -291,7 +292,7 @@ def adding_mesh_object(name, obj_to_load, texture_to_load, model_info_path=None,
                 mesh = visii.mesh.create_from_file(name,obj_to_load),
             )
         toy_transform = obj_export.get_transform()
-        obj_export.get_material().set_roughness(random.uniform(0.1, 0.5))
+        obj_export.get_material().set_roughness(random.uniform(0.1, 0.8))
 
         for toy in toys:
             visii.entity.remove(toy)
@@ -312,15 +313,72 @@ def adding_mesh_object(name, obj_to_load, texture_to_load, model_info_path=None,
             mesh=toy_mesh,
             material=visii.material.create(name)
         )
+        print(texture_to_load)
+        if "cube" in texture_to_load.lower():
+            import cv2 
 
-        toy_rgb_tex = visii.texture.create_from_file(name, texture_to_load)
+            # red = 255,0,0
+            # blue = 0,12,255
+            # green = 134,236,1
+            # yello = 255,210,0
+            # black = 0,0,0
+            # white = 255,255,255
+
+            img = cv2.imread(texture_to_load)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)    
+
+
+            colors = [
+                [[384,0,640,256],[0,0.05]],
+                [[640,256,896,512],[0.6,0.7]],
+                [[384,512,641,767],[0.35,0.4]],
+                [[384,767,641,1024],[0.14,0.18]],
+                [[128,255,384,511],[0,0.3]],
+                [[383,256,640,512],[0.7,1]],
+            ]
+
+            for ic, c in enumerate(colors): 
+                import colorsys
+                if ic >3:
+                    rgb = colorsys.hsv_to_rgb(
+                        1,0,
+                        random.uniform(c[1][0],c[1][1])
+                    )
+                    # rgb = [c[0][0]/255,c[0][1]/255,c[0][2]/255]
+                    
+                else:
+                    rgb = colorsys.hsv_to_rgb(
+                        random.uniform(c[1][0],c[1][1]),
+                        random.uniform(0.7,1),
+                        random.uniform(0.6,1)
+                    )
+
+                img[c[0][1]:c[0][3],c[0][0]:c[0][2],0] = rgb[0]*255
+                img[c[0][1]:c[0][3],c[0][0]:c[0][2],1] = rgb[1]*255
+                img[c[0][1]:c[0][3],c[0][0]:c[0][2],2] = rgb[2]*255
+
+
+            # img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            # cv2.imwrite('tmp.png',img)
+            toy_rgb_tex = visii.texture.create_from_data(
+                name,
+                img.shape[0],
+                img.shape[1],
+                (img.flatten()/255.0).astype(np.float32),
+                linear = False, 
+                hdr = False
+            )
+            # raise()
+
+        else:
+            toy_rgb_tex = visii.texture.create_from_file(name, texture_to_load)
         toy.get_material().set_base_color_texture(toy_rgb_tex)
         toy.get_material().set_roughness(random.uniform(0.1, 0.5))
 
         toy_transform = toy.get_transform()
 
     ###########################
-
+    print(scale)
     toy_transform.set_scale(visii.vec3(scale))
     toy_transform.set_position(
         visii.vec3(
@@ -404,10 +462,13 @@ if opt.path_single_obj is not None:
         model_info_path = os.path.dirname(opt.path_single_obj) + '/model_info.json'
         adding_mesh_object(f"single_obj_{i_object}",
                            opt.path_single_obj,
-                           None,
+                           opt.path_single_obj.replace('cube.obj',"Cube.png"),
                            model_info_path,
                            scale=opt.scale,
-                           debug=opt.debug)
+                           debug=opt.debug,
+                           randomize_tex = True
+                           )
+
 else:
     google_content_folder = glob.glob(opt.objs_folder + "*/")
 
