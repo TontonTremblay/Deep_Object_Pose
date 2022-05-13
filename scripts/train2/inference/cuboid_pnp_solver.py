@@ -19,9 +19,16 @@ class CuboidPNPSolver(object):
     cv2version = cv2.__version__.split('.')
     cv2majorversion = int(cv2version[0])
 
-    def __init__(self, object_name="", camera_intrinsic_matrix = None, cuboid3d = None, 
-            dist_coeffs = np.zeros((4, 1))):
+    def __init__(self, object_name = "", 
+            camera_intrinsic_matrix = None, 
+            cuboid3d = None, 
+            dist_coeffs = np.zeros((4, 1)),
+            min_required_points = 4
+        ):
+        
         self.object_name = object_name
+        self.min_required_points = max(4, min_required_points)
+        
         if (not camera_intrinsic_matrix is None):
             self._camera_intrinsic_matrix = camera_intrinsic_matrix
         else:
@@ -32,8 +39,6 @@ class CuboidPNPSolver(object):
             ])
         self._cuboid3d = cuboid3d
         
-        # print (cuboid3d.get_vertices())
-        # raise()
         self._dist_coeffs = dist_coeffs
 
     def set_camera_intrinsic_matrix(self, new_intrinsic_matrix):
@@ -43,12 +48,63 @@ class CuboidPNPSolver(object):
     def set_dist_coeffs(self, dist_coeffs):
         '''Sets the camera intrinsic matrix'''
         self._dist_coeffs = dist_coeffs
+    
+    def __check_pnp_result(self,
+                           points,
+                           projected_points,
+                           fail_if_projected_diff_exceeds,
+                           fail_if_projected_value_exceeds):
+        """
+        Check whether the output of PNP seems reasonable
+        Inputs:
+        - cuboid2d_points:  list of XY tuples
+        - projected points:  np.ndarray of np.ndarrays
+        """
 
-    def solve_pnp(self, cuboid2d_points, pnp_algorithm = None):
+        p1 = points
+        p2 = projected_points.tolist()
+        assert len(p1) == len(p2)
+
+        # Compute max Euclidean 2D distance b/w points and projected points
+        max_euclidean_dist = 0
+        for i in range(len(p1)):
+            if p1[i] is not None:
+                dist = np.linalg.norm(np.array(p1[i]) - np.array(p2[i]))
+                if dist > max_euclidean_dist:
+                    max_euclidean_dist = dist
+        
+        # Compute max projected absolute value
+        max_abs_value = 0
+        for i in range(len(p2)):
+            assert len(p2[i]) == 2
+            for val in p2[i]:
+                if val > max_abs_value:
+                    max_abs_value = val
+        
+        # Return success (true) or failure (false)
+        return max_euclidean_dist <= fail_if_projected_diff_exceeds \
+            and max_abs_value <= fail_if_projected_value_exceeds
+
+    def solve_pnp(self, 
+            cuboid2d_points, 
+            pnp_algorithm = None,
+            fail_if_projected_diff_exceeds = 50,
+            fail_if_projected_value_exceeds = 1e5
+        ):
         """
         Detects the rotation and traslation 
         of a cuboid object from its vertexes' 
         2D location in the image
+
+        Inputs:
+        - cuboid2d_points:  list of XY tuples
+          ...
+
+        Outputs:
+        - location in 3D
+        - pose in 3D (as quaternion)
+        - projected points:  np.ndarray of np.ndarrays
+
         """
 
         # Fallback to default PNP algorithm base on OpenCV version
@@ -59,11 +115,9 @@ class CuboidPNPSolver(object):
                 pnp_algorithm = cv2.SOLVEPNP_ITERATIVE
                 # Alternative algorithms:
                 # pnp_algorithm = SOLVE_PNP_P3P  
-                # pnp_algorithm = cv2.SOLVEPNP_EPNP 
-        if pnp_algorithm is None:
-            # pnp_algorithm = 1
-            pnp_algorithm = cv2.SOLVEPNP_EPNP 
-
+                # pnp_algorithm = SOLVE_PNP_EPNP    
+            else:
+                pnp_algorithm = cv2.SOLVEPNP_EPNP  
         
         location = None
         quaternion = None
@@ -87,10 +141,10 @@ class CuboidPNPSolver(object):
         valid_point_count = len(obj_2d_points)
 
         # Can only do PNP if we have more than 3 valid points
-        is_points_valid = valid_point_count >= 4
+        is_points_valid = valid_point_count >= self.min_required_points
 
         if is_points_valid:
-            
+
             ret, rvec, tvec = cv2.solvePnP(
                 obj_3d_points,
                 obj_2d_points,
@@ -106,9 +160,16 @@ class CuboidPNPSolver(object):
                 projected_points, _ = cv2.projectPoints(cuboid3d_points, rvec, tvec, self._camera_intrinsic_matrix, self._dist_coeffs)
                 projected_points = np.squeeze(projected_points)
                 
+                success = self.__check_pnp_result(
+                            cuboid2d_points,
+                            projected_points,
+                            fail_if_projected_diff_exceeds,
+                            fail_if_projected_value_exceeds)
+
+
                 # If the location.Z is negative or object is behind the camera then flip both location and rotation
                 x, y, z = location
-                if z < 0:
+                if z < 0 or not success:
                     # Get the opposite location
                     location = [-x, -y, -z]
 
@@ -116,7 +177,15 @@ class CuboidPNPSolver(object):
                     rotate_angle = np.pi
                     rotate_quaternion = Quaternion.from_axis_rotation(location, rotate_angle)
                     quaternion = rotate_quaternion.cross(quaternion)
-
+                    location = None
+                    quaternion = None
+        #             print("PNP solution is behind the camera (Z < 0) => flip the location and rotation")
+        #         else:
+        #             print("solvePNP found good results - location: {} - rotation: {} !!!".format(location, quaternion))
+        #     else:
+        #         print('Error:  solvePnP return false ****************************************')
+        # else:
+        #     print("Need at least 4 valid points in order to run PNP. Currently: {}".format(valid_point_count))
         return location, quaternion, projected_points
 
     def convert_rvec_to_quaternion(self, rvec):

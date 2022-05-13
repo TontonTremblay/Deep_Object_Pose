@@ -9,51 +9,637 @@ Contains the following classes:
 '''
 
 import time
-import json
-import os, shutil
-import sys
-import traceback
 from os import path
-import threading
-from threading import Thread
 
 import numpy as np
-import cv2
-
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
-from torch.autograd import Variable
 import torchvision.models as models
-
-from scipy import ndimage
-import scipy
-import scipy.ndimage as ndimage
-import scipy.ndimage.filters as filters
+import torchvision.transforms as transforms
 from scipy.ndimage.filters import gaussian_filter
 from scipy import optimize
-
-import sys 
-sys.path.append("../")
-from models import * 
+from torch.autograd import Variable
 
 # Import the definition of the neural network model and cuboids
-from cuboid_pnp_solver import *
 
 #global transform for image input
-transform = transforms.Compose([
+global_transform = transforms.Compose([
     # transforms.Scale(IMAGE_SIZE),
     # transforms.CenterCrop((imagesize,imagesize)),
     transforms.ToTensor(),
-    # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    transforms.Normalize(    
-                    (0.485, 0.456, 0.406),
-                    (0.229, 0.224, 0.225)
-                    )
+    # transforms.Normalize((0.5, 0.5, 0.5), (0.25, 0.25, 0.25)),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    # transforms.Normalize((0.59, 0.59, 0.59), (0.25, 0.25, 0.25)),
     ])
 
 
 #================================ Models ================================
+
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, norm_layer=None):
+        padding = (kernel_size - 1) // 2
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding, groups=groups, bias=False),
+            norm_layer(out_planes),
+            nn.ReLU6(inplace=True)
+        )
+
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, inp, oup, stride, expand_ratio, norm_layer=None):
+        super(InvertedResidual, self).__init__()
+        self.stride = stride
+        assert stride in [1, 2]
+
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+
+        hidden_dim = int(round(inp * expand_ratio))
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        if expand_ratio != 1:
+            # pw
+            layers.append(ConvBNReLU(inp, hidden_dim, kernel_size=1, norm_layer=norm_layer))
+        layers.extend([
+            # dw
+            ConvBNReLU(hidden_dim, hidden_dim, stride=stride, groups=hidden_dim, norm_layer=norm_layer),
+            # pw-linear
+            nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+            norm_layer(oup),
+        ])
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+class DopeMobileNet(nn.Module):
+    def __init__(
+            self,
+            pretrained=False,
+            numBeliefMap=9,
+            numAffinity=16,
+            stop_at_stage=6  # number of stages to process (if less than total number of stages)
+        ):
+        super(DopeMobileNet, self).__init__()
+
+        self.mobile_feature = torch.hub.load('pytorch/vision:v0.6.0', 'mobilenet_v2', pretrained=False).features
+
+        # upsample to 50x50 from 13x13
+        self.upsample = nn.Sequential()
+        self.upsample.add_module('0', nn.Upsample(scale_factor=2))
+
+        # should this go before the upsample?
+        # self.upsample.add_module('4', nn.Conv2d(1280, 640,
+        #     kernel_size=3, stride=1, padding=1))
+        self.upsample.add_module('44',InvertedResidual(1280, 640, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))
+        # self.upsample.add_module('55',InvertedResidual(1280, 640, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))
+
+        # self.upsample.add_module('5', nn.ReLU(inplace=True))
+
+        # self.upsample.add_module('6', nn.Conv2d(640, 320,
+        #     kernel_size=3, stride=1, padding=1))
+
+        self.upsample.add_module('10', nn.Upsample(scale_factor=2))
+        # self.upsample.add_module('14', nn.Conv2d(320, 160,
+        #     kernel_size=3, stride=1, padding=1))
+        # self.upsample.add_module('15', nn.ReLU(inplace=True))
+        # self.upsample.add_module('16', nn.Conv2d(160, 64,
+        #     kernel_size=3, stride=1, padding=0))
+        self.upsample.add_module('55',InvertedResidual(640, 320, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))
+        self.upsample.add_module('56',InvertedResidual(320, 64, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))
+
+        # set 50,50
+        self.upsample.add_module('4', nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0))
+
+        # final output - change that for mobile block
+        # self.heads_0 = nn.Sequential()
+
+        def build_block(inputs, outputs, nb_layers = 2 ):
+            layers = []
+            layers.append(InvertedResidual(inputs, 64, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))
+            for l in range(nb_layers-1):
+                layers.append(InvertedResidual(64, 64, stride=1, expand_ratio=6, norm_layer=nn.BatchNorm2d))        
+            layers.append(nn.Conv2d(64, outputs, kernel_size=3, stride=1, padding=1))
+            # layers.append('4', nn.Conv2d(64, outputs, kernel_size=3, stride=1, padding=1))
+            return nn.Sequential(*layers)
+
+        self.head_0_beliefs = build_block(64,numBeliefMap)
+        self.head_0_aff = build_block(64,(numBeliefMap-1)*2,3)
+
+        self.head_1_beliefs = build_block(64+numBeliefMap+((numBeliefMap-1)*2),numBeliefMap,3)
+        self.head_1_aff = build_block(64+numBeliefMap+(numBeliefMap-1)*2,(numBeliefMap-1)*2,2)
+
+        self.head_2_beliefs = build_block(64+numBeliefMap+((numBeliefMap-1)*2),numBeliefMap,3)
+        self.head_2_aff = build_block(64+numBeliefMap+(numBeliefMap-1)*2,(numBeliefMap-1)*2,1)
+
+
+
+    def forward(self, x):
+        '''Runs inference on the neural network'''
+        # print(x.shape)
+        out_features = self.mobile_feature(x)
+        # print('out2_features',out_features.shape)
+        output_up = self.upsample(out_features)
+        # print('output_up',output_up.shape)
+
+        # stages
+        belief_0 = self.head_0_beliefs(output_up)
+        aff_0 = self.head_0_aff(output_up)
+
+        # print(belief_0.shape)
+
+        out_0 = torch.cat([output_up, belief_0, aff_0], 1)
+
+        # print(out_0.shape)
+        # raise()
+        belief_1 = self.head_1_beliefs(out_0)
+        aff_1 = self.head_1_aff(out_0)
+
+        out_1 = torch.cat([output_up, belief_1, aff_1], 1)
+
+        belief_2 = self.head_2_beliefs(out_1)
+        aff_2 = self.head_2_aff(out_1)
+
+        return  [belief_0,belief_1,belief_2],\
+                [aff_0,aff_1,aff_2]
+        
+
+class DreamHourglassMultiStage(nn.Module):
+    def __init__(self, n_keypoints,
+                       n_image_input_channels = 3,
+                       internalize_spatial_softmax = True,
+                       learned_beta = True,
+                       initial_beta = 1.,
+                       n_stages = 2,
+                       joints_input = 0,
+                       skip_connections = False,
+                       deconv_decoder = False,
+                       full_output = False):
+        super(DreamHourglassMultiStage, self).__init__()
+
+        self.n_keypoints = n_keypoints
+        self.n_image_input_channels = n_image_input_channels
+        self.internalize_spatial_softmax = internalize_spatial_softmax
+        self.skip_connections = skip_connections
+        self.deconv_decoder = deconv_decoder
+        self.full_output = full_output 
+
+        if self.internalize_spatial_softmax:
+            # This warning is because the forward code just ignores the second head (spatial softmax)
+            # Revisit later if we need multistage networks where each stage has multiple output heads that are needed
+            print("WARNING: Keypoint softmax output head is currently unused. Prefer training new models of this type with internalize_spatial_softmax = False.")
+            self.n_output_heads = 2
+            self.learned_beta = learned_beta
+            self.initial_beta = initial_beta
+        else:
+            self.n_output_heads = 1
+            self.learned_beta = False
+        self.joints_input = joints_input
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        assert isinstance(n_stages, int), \
+            "Expected \"n_stages\" to be an integer, but it is {}.".format(type(n_stages))
+        assert 0 < n_stages and n_stages <= 6, \
+            "DreamHourglassMultiStage can only be constructed with 1 to 6 stages at this time."
+
+        self.num_stages = n_stages
+
+        # Stage 1
+        self.stage1 = DreamHourglass(
+            n_keypoints,
+            n_image_input_channels,
+            internalize_spatial_softmax,
+            learned_beta,
+            initial_beta,
+            joints_input = joints_input,
+            skip_connections = skip_connections,
+            deconv_decoder = deconv_decoder,
+            full_output = self.full_output,
+        )
+
+        # Stage 2
+        if self.num_stages > 1:
+            self.stage2 = DreamHourglass(
+                n_keypoints,
+                n_image_input_channels + n_keypoints + (n_keypoints-1)*2, # Includes the most previous stage
+                internalize_spatial_softmax,
+                learned_beta,
+                initial_beta,
+                joints_input = joints_input,
+                skip_connections = skip_connections,
+                deconv_decoder = deconv_decoder,
+                full_output = self.full_output,
+            )
+
+        # Stage 3
+        if self.num_stages > 2:
+            self.stage3 = DreamHourglass(
+                n_keypoints,
+                n_image_input_channels + n_keypoints, # Includes the most previous stage
+                internalize_spatial_softmax,
+                learned_beta,
+                initial_beta,
+                joints_input = joints_input,
+                skip_connections = skip_connections,
+                deconv_decoder = deconv_decoder,
+                full_output = self.full_output,
+            )
+
+        # Stage 4
+        if self.num_stages > 3:
+            self.stage4 = DreamHourglass(
+                n_keypoints,
+                n_image_input_channels + n_keypoints, # Includes the most previous stage
+                internalize_spatial_softmax,
+                learned_beta,
+                initial_beta,
+                joints_input = joints_input,
+                skip_connections = skip_connections,
+                deconv_decoder = deconv_decoder,
+                full_output = self.full_output,
+            )
+
+        # Stage 5
+        if self.num_stages > 4:
+            self.stage5 = DreamHourglass(
+                n_keypoints,
+                n_image_input_channels + n_keypoints, # Includes the most previous stage
+                internalize_spatial_softmax,
+                learned_beta,
+                initial_beta,
+                joints_input = joints_input,
+                skip_connections = skip_connections,
+                deconv_decoder = deconv_decoder,
+                full_output = self.full_output,
+            )
+
+        # Stage 6
+        if self.num_stages > 5:
+            self.stage6 = DreamHourglass(
+                n_keypoints,
+                n_image_input_channels + n_keypoints, # Includes the most previous stage
+                internalize_spatial_softmax,
+                learned_beta,
+                initial_beta,
+                joints_input = joints_input,
+                skip_connections = skip_connections,
+                deconv_decoder = deconv_decoder,
+                full_output = self.full_output,
+            )
+
+    def forward(self, x, joints = None, verbose = False):
+
+        y_output_stage1 = self.stage1(x, joints=joints)
+        y_0_1 = y_output_stage1[0] # Just keeping belief maps for now
+        y_1_1 = y_output_stage1[1]
+
+        if self.num_stages == 1:
+            return [y_0_1],[y_1_1]
+
+        if self.num_stages > 1:
+            # Upsample
+            # print(x.shape,y_0_1.shape,y_1_1.shape)
+            y_output_stage2 = self.stage2(torch.cat([x, y_0_1,y_1_1], dim=1), joints=joints)
+            y2 = y_output_stage2[0] # Just keeping belief maps for now
+
+            if self.num_stages == 2:
+                return [y_0_1, y2],[y_1_1,y_output_stage2[1]]
+
+        # if self.num_stages > 2:
+        #     # Upsample
+        #     if self.deconv_decoder or self.full_output:
+        #         y2_upsampled = y2
+        #     else:
+        #         y2_upsampled = nn.functional.interpolate(y2, scale_factor=4) # TBD: change scale factor depending on image resolution
+        #     y_output_stage3 = self.stage3(torch.cat([x, y2_upsampled], dim=1), joints=joints)
+        #     y3 = y_output_stage3[0] # Just keeping belief maps for now
+
+        #     if self.num_stages == 3:
+        #         return [y_0_1, y2, y3]
+
+        # if self.num_stages > 3:
+        #     # Upsample
+        #     if self.deconv_decoder or self.full_output:
+        #         y3_upsampled = y3
+        #     else:
+        #         y3_upsampled = nn.functional.interpolate(y3, scale_factor=4) # TBD: change scale factor depending on image resolution
+        #     y_output_stage4 = self.stage4(torch.cat([x, y3_upsampled], dim=1), joints=joints)
+        #     y4 = y_output_stage4[0] # Just keeping belief maps for now
+
+        #     if self.num_stages == 4:
+        #         return [y_0_1, y2, y3, y4]
+
+        # if self.num_stages > 4:
+        #     # Upsample
+        #     if self.deconv_decoder or self.full_output:
+        #         y4_upsampled = y4
+        #     else:
+        #         y4_upsampled = nn.functional.interpolate(y4, scale_factor=4) # TBD: change scale factor depending on image resolution
+        #     y_output_stage5 = self.stage5(torch.cat([x, y4_upsampled], dim=1), joints=joints)
+        #     y5 = y_output_stage5[0] # Just keeping belief maps for now
+
+        #     if self.num_stages == 5:
+        #         return [y_0_1, y2, y3, y4, y5]
+
+        # if self.num_stages > 5:
+        #     # Upsample
+        #     if self.deconv_decoder or self.full_output:
+        #         y5_upsampled = y5
+        #     else:
+        #         y5_upsampled = nn.functional.interpolate(y5, scale_factor=4) # TBD: change scale factor depending on image resolution
+        #     y_output_stage6 = self.stage6(torch.cat([x, y5_upsampled], dim=1), joints=joints)
+        #     y6 = y_output_stage6[0] # Just keeping belief maps for now
+
+        #     if self.num_stages == 6:
+        #         return [y_0_1, y2, y3, y4, y5, y6]
+
+
+# Based on DopeHourglassBlockSmall, not using skipped connections
+class DreamHourglass(nn.Module):
+    def __init__(self, n_keypoints,
+                       n_image_input_channels = 3,
+                       internalize_spatial_softmax = True,
+                       learned_beta = True,
+                       initial_beta = 1.,
+                       joints_input = 0,
+                       skip_connections = False,
+                       deconv_decoder = False,
+                       full_output = False):
+        super(DreamHourglass, self).__init__()
+        self.n_keypoints = n_keypoints
+        self.n_image_input_channels = n_image_input_channels
+        self.internalize_spatial_softmax = internalize_spatial_softmax
+        self.skip_connections = skip_connections
+        self.deconv_decoder = deconv_decoder
+        self.full_output = full_output
+
+        if self.internalize_spatial_softmax:
+            self.n_output_heads = 2
+            self.learned_beta = learned_beta
+            self.initial_beta = initial_beta
+        else:
+            self.n_output_heads = 1
+            self.learned_beta = False
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        vgg_t = models.vgg19(pretrained=False).features
+
+        self.down_sample = nn.MaxPool2d(2)
+
+        self.layer_0_1_down = nn.Sequential()
+        self.layer_0_1_down.add_module('0', nn.Conv2d(self.n_image_input_channels, 64,
+            kernel_size=3, stride=1, padding=1))
+        for layer in range(1,4):
+            self.layer_0_1_down.add_module(str(layer), vgg_t[layer])
+
+        self.layer_0_2_down = nn.Sequential()
+        for layer in range(5,9):
+            self.layer_0_2_down.add_module(str(layer), vgg_t[layer])
+
+        self.layer_0_3_down = nn.Sequential()
+        for layer in range(10,18):
+            self.layer_0_3_down.add_module(str(layer), vgg_t[layer])
+
+        self.layer_0_4_down = nn.Sequential()
+        for layer in range(19,27):
+            self.layer_0_4_down.add_module(str(layer), vgg_t[layer])
+
+        self.layer_0_5_down = nn.Sequential()
+        for layer in range(28,36):
+            self.layer_0_5_down.add_module(str(layer), vgg_t[layer])
+
+        #Head 1 
+        if self.deconv_decoder:
+            # Decoder primarily uses ConvTranspose2d
+            self.deconv_0_4 = nn.Sequential()
+            deconv_input = 513 if joints_input > 0 else 512
+            self.deconv_0_4.add_module('0', nn.ConvTranspose2d(deconv_input, 256,
+                kernel_size=(3, 3), stride=(2, 2), padding=1, output_padding=1))
+            self.deconv_0_4.add_module('1', nn.ReLU(inplace=True))
+            self.deconv_0_4.add_module('2', nn.Conv2d(256, 256,
+                kernel_size=3, stride=1, padding=1))
+            self.deconv_0_4.add_module('3', nn.ReLU(inplace=True))
+
+            self.deconv_0_3 = nn.Sequential()
+            self.deconv_0_3.add_module('0', nn.ConvTranspose2d(256, 128,
+                kernel_size=(3, 3), stride=(2, 2), padding=1, output_padding=1))
+            self.deconv_0_3.add_module('1', nn.ReLU(inplace=True))
+            self.deconv_0_3.add_module('2', nn.Conv2d(128, 128,
+                kernel_size=3,stride=1,padding=1))
+            self.deconv_0_3.add_module('3', nn.ReLU(inplace=True))
+
+            self.deconv_0_2 = nn.Sequential()
+            self.deconv_0_2.add_module('0', nn.ConvTranspose2d(128, 64,
+                kernel_size=(3, 3), stride=(2, 2), padding=1, output_padding=1))
+            self.deconv_0_2.add_module('1', nn.ReLU(inplace=True))
+            self.deconv_0_2.add_module('2', nn.Conv2d(64, 64,
+                kernel_size=3,stride=1,padding=1))
+            self.deconv_0_2.add_module('3', nn.ReLU(inplace=True))
+
+            self.deconv_0_1 = nn.Sequential()
+            self.deconv_0_1.add_module('0', nn.ConvTranspose2d(64, 64,
+                kernel_size=(3, 3), stride=(2, 2), padding=1, output_padding=1))
+            self.deconv_0_1.add_module('1', nn.ReLU(inplace=True))
+
+        else:
+            # Decoder primarily uses Upsampling - for keypoints 
+            self.upsample_0_4 = nn.Sequential()
+            self.upsample_0_4.add_module('0', nn.Upsample(scale_factor=2))
+
+            # should this go before the upsample?
+            upsample_input = 513 if joints_input > 0 else 512
+            self.upsample_0_4.add_module('4', nn.Conv2d(upsample_input, 256,
+                kernel_size=3, stride=1, padding=1))
+            self.upsample_0_4.add_module('5', nn.ReLU(inplace=True))
+            self.upsample_0_4.add_module('6', nn.Conv2d(256, 256,
+                kernel_size=3, stride=1, padding=1))
+
+            self.upsample_0_3 = nn.Sequential()
+            self.upsample_0_3.add_module('0', nn.Upsample(scale_factor=2))
+            self.upsample_0_3.add_module('4', nn.Conv2d(256, 128,
+                kernel_size=3, stride=1, padding=1))
+            self.upsample_0_3.add_module('5', nn.ReLU(inplace=True))
+            self.upsample_0_3.add_module('6', nn.Conv2d(128, 64,
+                kernel_size=3, stride=1, padding=1))
+
+            if self.full_output: 
+                self.upsample_0_2 = nn.Sequential()
+                self.upsample_0_2.add_module('0', nn.Upsample(scale_factor=2))
+                self.upsample_0_2.add_module('2', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_0_2.add_module('3', nn.ReLU(inplace=True))
+                self.upsample_0_2.add_module('4', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_0_2.add_module('5', nn.ReLU(inplace=True))
+
+
+                self.upsample_0_1 = nn.Sequential()
+                self.upsample_0_1.add_module('00', nn.Upsample(scale_factor=2))
+                self.upsample_0_1.add_module('2', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_0_1.add_module('3', nn.ReLU(inplace=True))
+                self.upsample_0_1.add_module('4', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_0_1.add_module('5', nn.ReLU(inplace=True))
+
+            # Decoder primarily uses Upsampling - for affinities
+            self.upsample_1_4 = nn.Sequential()
+            self.upsample_1_4.add_module('0', nn.Upsample(scale_factor=2))
+
+            # should this go before the upsample?
+            upsample_input = 513 if joints_input > 0 else 512
+            self.upsample_1_4.add_module('4', nn.Conv2d(upsample_input, 256,
+                kernel_size=3, stride=1, padding=1))
+            self.upsample_1_4.add_module('5', nn.ReLU(inplace=True))
+            self.upsample_1_4.add_module('6', nn.Conv2d(256, 256,
+                kernel_size=3, stride=1, padding=1))
+
+            self.upsample_1_3 = nn.Sequential()
+            self.upsample_1_3.add_module('0', nn.Upsample(scale_factor=2))
+            self.upsample_1_3.add_module('4', nn.Conv2d(256, 128,
+                kernel_size=3, stride=1, padding=1))
+            self.upsample_1_3.add_module('5', nn.ReLU(inplace=True))
+            self.upsample_1_3.add_module('6', nn.Conv2d(128, 64,
+                kernel_size=3, stride=1, padding=1))
+
+            if self.full_output: 
+                self.upsample_1_2 = nn.Sequential()
+                self.upsample_1_2.add_module('0', nn.Upsample(scale_factor=2))
+                self.upsample_1_2.add_module('2', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_1_2.add_module('3', nn.ReLU(inplace=True))
+                self.upsample_1_2.add_module('4', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_1_2.add_module('5', nn.ReLU(inplace=True))
+
+
+                self.upsample_1_1 = nn.Sequential()
+                self.upsample_1_1.add_module('00', nn.Upsample(scale_factor=2))
+                self.upsample_1_1.add_module('2', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_1_1.add_module('3', nn.ReLU(inplace=True))
+                self.upsample_1_1.add_module('4', nn.Conv2d(64, 64,
+                    kernel_size=3,stride=1,padding=1))
+                self.upsample_1_1.add_module('5', nn.ReLU(inplace=True))
+
+
+        # Output head - goes from [batch x 64 x height x width] -> [batch x n_keypoints x height x width]
+        self.heads_0 = nn.Sequential()
+        self.heads_0.add_module('0', nn.Conv2d(64, 64,
+            kernel_size=3, stride=1, padding=1))
+        self.heads_0.add_module('1', nn.ReLU(inplace=True))
+        self.heads_0.add_module('2', nn.Conv2d(64, 32,
+            kernel_size=3, stride=1, padding=1))
+        self.heads_0.add_module('3', nn.ReLU(inplace=True))
+        self.heads_0.add_module('4', nn.Conv2d(32, self.n_keypoints, 
+            kernel_size=3, stride=1, padding=1))
+
+        self.heads_1 = nn.Sequential()
+        self.heads_1.add_module('0', nn.Conv2d(64, 64,
+            kernel_size=3, stride=1, padding=1))
+        self.heads_1.add_module('1', nn.ReLU(inplace=True))
+        self.heads_1.add_module('2', nn.Conv2d(64, 32,
+            kernel_size=3, stride=1, padding=1))
+        self.heads_1.add_module('3', nn.ReLU(inplace=True))
+        self.heads_1.add_module('4', nn.Conv2d(32, (self.n_keypoints-1)*2, 
+            kernel_size=3, stride=1, padding=1))
+
+
+    def forward(self, x, joints=None):
+
+        # Encoder
+        x_0_1   = self.layer_0_1_down(x)
+        x_0_1_d = self.down_sample(x_0_1)
+        x_0_2   = self.layer_0_2_down(x_0_1_d)
+        x_0_2_d = self.down_sample(x_0_2)
+        x_0_3   = self.layer_0_3_down(x_0_2_d)
+        x_0_3_d = self.down_sample(x_0_3)
+        x_0_4   = self.layer_0_4_down(x_0_3_d)
+        x_0_4_d = self.down_sample(x_0_4)
+        x_0_5   = self.layer_0_5_down(x_0_4_d)
+
+        # Append joints to latent space if provided
+        if joints is not None:
+            joint_output = self.joint_head(joints)
+            if self.skip_connections:
+                decoder_input = torch.cat([x_0_5 + x_0_4_d, joint_output.reshape(joint_output.shape[0],1,25,25)], dim=1)
+            else:
+                decoder_input = torch.cat([x_0_5, joint_output.reshape(joint_output.shape[0],1,25,25)], dim=1)
+        else:
+            if self.skip_connections:
+                decoder_input = x_0_5 + x_0_4_d
+            else:
+                decoder_input = x_0_5
+
+        # Decoder
+        if self.deconv_decoder:
+            y_0_5 = self.deconv_0_4(decoder_input)
+
+            if self.skip_connections:
+                y_0_4 = self.deconv_0_3(y_0_5 + x_0_3_d)
+            else:
+                y_0_4 = self.deconv_0_3(y_0_5)
+
+            if self.skip_connections:
+                y_0_3 = self.deconv_0_2(y_0_4 + x_0_2_d)
+            else:
+                y_0_3 = self.deconv_0_2(y_0_4)
+
+            if self.skip_connections:
+                y_0_out = self.deconv_0_1(y_0_3 + x_0_1_d)
+            else:
+                y_0_out = self.deconv_0_1(y_0_3)
+
+            if self.skip_connections:
+                output_head_0 = self.heads_0(y_0_out + x_0_1)
+            else:
+                output_head_0 = self.heads_0(y_0_out)
+
+        else:
+            y_0_5 = self.upsample_0_4(decoder_input)
+
+            if self.skip_connections:
+                y_0_out = self.upsample_0_3(y_0_5 + x_0_3_d)
+            else:
+                y_0_out = self.upsample_0_3(y_0_5)
+
+            if self.full_output:
+                y_0_out = self.upsample_0_2(y_0_out)
+                y_0_out = self.upsample_0_1(y_0_out)
+
+            output_head_0 = self.heads_0(y_0_out)
+
+            # SECOND HEAD
+            y_1_5 = self.upsample_1_4(decoder_input)
+
+            if self.skip_connections:
+                y_1_out = self.upsample_1_3(y_1_5 + x_1_3_d)
+            else:
+                y_1_out = self.upsample_1_3(y_1_5)
+
+            if self.full_output:
+                y_1_out = self.upsample_1_2(y_1_out)
+                y_1_out = self.upsample_1_1(y_1_out)
+
+            output_head_1 = self.heads_1(y_1_out)
+
+        # Output heads
+        outputs = []
+        outputs.append(output_head_0)
+
+        # Return outputs
+        return output_head_0,output_head_1
+
+
 
 
 class DopeNetwork(nn.Module):
@@ -67,6 +653,16 @@ class DopeNetwork(nn.Module):
 
         self.stop_at_stage = stop_at_stage
 
+        # vgg_full = torch.load('/home/jtremblay/Downloads/tlt/full_vgg19_openimages.zip')
+
+        # self.vgg = nn.Sequential()
+        # for i_layer in range(30):
+        #     self.vgg.add_module(str(i_layer), vgg_full[i_layer])
+
+        # # Add some layers
+        # i_layer = 30
+
+
         vgg_full = models.vgg19(pretrained=False).features
         self.vgg = nn.Sequential()
         for i_layer in range(24):
@@ -74,6 +670,8 @@ class DopeNetwork(nn.Module):
 
         # Add some layers
         i_layer = 23
+
+
         self.vgg.add_module(str(i_layer), nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1))
         self.vgg.add_module(str(i_layer+1), nn.ReLU(inplace=True))
         self.vgg.add_module(str(i_layer+2), nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1))
@@ -214,17 +812,14 @@ class DopeNetwork(nn.Module):
 
         return model
 
-
-
 class ModelData(object):
     '''This class contains methods for loading the neural network'''
 
-    def __init__(self, name="", net_path="", gpu_id=0,architecture='dope'):
+    def __init__(self, name="", net_path="", gpu_id=0):
         self.name = name
         self.net_path = net_path  # Path to trained network model
         self.net = None  # Trained network
         self.gpu_id = gpu_id
-        self.architecture = architecture
 
     def get_net(self):
         '''Returns network'''
@@ -245,10 +840,20 @@ class ModelData(object):
         '''Loads network model from disk with given path'''
         model_loading_start_time = time.time()
         print("Loading DOPE model '{}'...".format(path))
-        if self.architecture == 'dope':
-            net = DopeNetwork()
+
+        if 'full' in path:
+            net = DreamHourglassMultiStage(
+                9,
+                n_stages = 2,
+                internalize_spatial_softmax = False,
+                deconv_decoder = False,
+                full_output = True,
+                )
+        elif 'mobile' in path:
+            net = DopeMobileNet()
         else:
-            net = ResnetSimple()
+            net = DopeNetwork()
+
         net = torch.nn.DataParallel(net, [0]).cuda()
         net.load_state_dict(torch.load(path))
         net.eval()
@@ -401,26 +1006,51 @@ class ObjectDetector(object):
         return im
 
     @staticmethod
-    def detect_object_in_image(net_model, pnp_solver, in_img, config, 
-            grid_belief_debug = False, norm_belief=True):
+    def detect_object_in_image(
+            net_model, 
+            pnp_solver, 
+            in_img, 
+            config, 
+            grid_belief_debug = False, 
+            norm_belief=True, 
+            run_sampling=False,
+            network = 'dope',
+            transform = None):
         ''' Detect objects in a image using a specific trained network model
             Returns the poses of the objects and the belief maps
             '''
-
         if in_img is None:
             return []
+
+        if network == 'full':
+            scale_factor = 1
+            OFFSET_DUE_TO_UPSAMPLING = 0 
+        else: # 'dope' and 'mobile'
+            scale_factor = 8
+            # OFFSET_DUE_TO_UPSAMPLING = 0.4395
+            OFFSET_DUE_TO_UPSAMPLING = 0
+
+
 
         # print("detect_object_in_image - image shape: {}".format(in_img.shape))
 
         # Run network inference
-        image_tensor = transform(in_img)
+        # print(in_img.shape)
+        if transform is None: 
+            image_tensor = global_transform(in_img)
+        else:
+            image_tensor = transform(in_img)
         image_torch = Variable(image_tensor).cuda().unsqueeze(0)
+        print(image_torch.shape)
         out, seg = net_model(image_torch)  # run inference using the network (calls 'forward' method)
         vertex2 = out[-1][0]
         aff = seg[-1][0]
 
         # Find objects from network output
-        detected_objects = ObjectDetector.find_object_poses(vertex2, aff, pnp_solver, config)
+        detected_objects = ObjectDetector.find_object_poses(vertex2, aff, pnp_solver, config,
+            run_sampling=run_sampling,
+            scale_factor = scale_factor,
+            OFFSET_DUE_TO_UPSAMPLING = OFFSET_DUE_TO_UPSAMPLING)
 
         if not grid_belief_debug: 
 
@@ -428,7 +1058,7 @@ class ObjectDetector(object):
         else:
             # Run the belief maps debug display on the beliefmaps
             
-            upsampling = nn.UpsamplingNearest2d(scale_factor=8)
+            upsampling = nn.UpsamplingNearest2d(scale_factor=scale_factor)
             tensor = vertex2
             belief_imgs = []
             in_img = (torch.tensor(in_img).float()/255.0)
@@ -437,8 +1067,8 @@ class ObjectDetector(object):
             for j in range(tensor.size()[0]):
                 belief = tensor[j].clone()
                 if norm_belief:
-                    belief -= float(torch.min(belief)[0].data.cpu().numpy())
-                    belief /= float(torch.max(belief)[0].data.cpu().numpy())
+                    belief -= float(torch.min(belief).item())
+                    belief /= float(torch.max(belief).item())
 
                 # print (image_torch.size())
                 # raise()    
@@ -447,9 +1077,13 @@ class ObjectDetector(object):
                 belief = upsampling(belief.unsqueeze(0).unsqueeze(0)).squeeze().squeeze().data 
                 belief = torch.clamp(belief,0,1).cpu()  
                 belief = torch.cat([
-                            belief.unsqueeze(0) + in_img[:,:,0],
-                            belief.unsqueeze(0) + in_img[:,:,1],
-                            belief.unsqueeze(0) + in_img[:,:,2]
+                            # belief.unsqueeze(0) + in_img[:,:,0],
+                            # belief.unsqueeze(0) + in_img[:,:,1],
+                            # belief.unsqueeze(0) + in_img[:,:,2]
+                            belief.unsqueeze(0),
+                            belief.unsqueeze(0),
+                            belief.unsqueeze(0)
+
                             ]).unsqueeze(0)
                 belief = torch.clamp(belief,0,1) 
 
@@ -467,14 +1101,21 @@ class ObjectDetector(object):
 
             
     @staticmethod
-    def find_object_poses(vertex2, aff, pnp_solver, config, run_sampling=False, num_sample=100,scale_factor=8):
+    def find_object_poses(vertex2, aff, pnp_solver, config, run_sampling=False, num_sample=100,scale_factor=8, 
+        OFFSET_DUE_TO_UPSAMPLING=0.4395):
         '''Detect objects given network output'''
 
         # run_sampling = True
         
         # Detect objects from belief maps and affinities
-        objects, all_peaks = ObjectDetector.find_objects(vertex2, aff, config,
-            run_sampling=run_sampling, num_sample=num_sample,scale_factor=scale_factor)
+        objects, all_peaks = ObjectDetector.find_objects(
+            vertex2, 
+            aff, 
+            config,
+            run_sampling=run_sampling, 
+            num_sample=num_sample,
+            scale_factor=scale_factor,
+            OFFSET_DUE_TO_UPSAMPLING = OFFSET_DUE_TO_UPSAMPLING)
         detected_objects = []
         obj_name = pnp_solver.object_name
         
@@ -519,14 +1160,14 @@ class ObjectDetector(object):
                     
                 try:
                     print ("----")
-                    print ("location:")
-                    print (location[0],location[1],location[2])
-                    print (np.mean(lx),np.mean(ly),np.mean(lz))
-                    print (np.std(lx),np.std(ly),np.std(lz))
+                    print ("location  :")
+                    print ("predicted :",location[0],location[1],location[2])
+                    print ('mean      :', np.mean(lx),np.mean(ly),np.mean(lz))
+                    print ('std       :', np.std(lx),np.std(ly),np.std(lz))
                     print ("quaternion:")
-                    print (quaternion[0],quaternion[1],quaternion[2],quaternion[3])
-                    print (np.mean(qx),np.mean(qy),np.mean(qz),np.mean(qw))
-                    print (np.std(qx),np.std(qy),np.std(qz),np.std(qw))
+                    print ('predicted: ', quaternion[0],quaternion[1],quaternion[2],quaternion[3])
+                    print ('mean:      ', np.mean(qx),np.mean(qy),np.mean(qz),np.mean(qw))
+                    print ('std:       ', np.std(qx),np.std(qy),np.std(qz),np.std(qw))
                 
                 
                 except:
@@ -538,7 +1179,8 @@ class ObjectDetector(object):
                     'quaternion': quaternion,
                     'cuboid2d': cuboid2d,
                     'projected_points': projected_points,
-                    'confidence': obj[-1],
+                    'confidence': obj[3],
+                    'score': obj[3],
                     'raw_points': points               
                 })
 
@@ -549,7 +1191,8 @@ class ObjectDetector(object):
         return detected_objects
 
     @staticmethod
-    def find_objects(vertex2, aff, config, numvertex=8, run_sampling=False, num_sample=100,scale_factor=8):
+    def find_objects(vertex2, aff, config, numvertex=8, run_sampling=False, num_sample=100,scale_factor=8,
+        OFFSET_DUE_TO_UPSAMPLING=0.4395):
         '''Detects objects given network belief maps and affinities, using heuristic method'''
 
         all_peaks = []
@@ -606,7 +1249,8 @@ class ObjectDetector(object):
                         weights[j+ran, i+ran] = (map_ori[p[1]+i, p[0]+j])
                 # if the weights are all zeros
                 # then add the none continuous points
-                OFFSET_DUE_TO_UPSAMPLING = 0.4395
+                # OFFSET_DUE_TO_UPSAMPLING = 0.4395
+                # OFFSET_DUE_TO_UPSAMPLING = 0.03
 
                 # Sample the points using the gaussian
                 if run_sampling:
